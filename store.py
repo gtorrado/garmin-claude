@@ -129,6 +129,9 @@ class Store:
         )
         return [r["id"] for r in rows]
 
+    def count_missing_details(self) -> int:
+        return self._query("SELECT COUNT(*) c FROM activities WHERE details IS NULL")[0]["c"]
+
     def recent_activities(self, limit: int, type_filter: str | None = None,
                           since: str | None = None) -> list[dict]:
         sql = "SELECT summary FROM activities WHERE 1=1"

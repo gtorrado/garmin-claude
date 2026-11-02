@@ -28,10 +28,11 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"),
 log = logging.getLogger("server")
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
-TZ = os.getenv("TZ_NAME", "UTC")
+TZ = os.getenv("TZ_NAME", "Europe/Lisbon")
 SECRET = os.getenv("MCP_SECRET", "")
 SYNC_INTERVAL_MIN = int(os.getenv("SYNC_INTERVAL_MIN", "60"))
-BACKFILL_DAYS = int(os.getenv("BACKFILL_DAYS", "90"))
+BACKFILL_DAYS = int(os.getenv("BACKFILL_DAYS", "730"))
+POLL_MIN = int(os.getenv("WORKOUT_POLL_MIN", "10"))
 
 store = Store(DATA_DIR / "garmin.db")
 syncer = GarminSyncer(store, DATA_DIR, TZ)
@@ -43,9 +44,9 @@ mcp = MCPServer(
         "Personal Garmin Connect data (health metrics, sleep, HRV, training readiness, "
         "training load, workouts), synced to a local history. For any question about the "
         "user's health, recovery, sleep or training, start with get_coach_briefing, then drill "
-        "down with the other tools. Dates are YYYY-MM-DD in the user's timezone. Data refreshes "
-        "automatically every hour; call sync_now if the user says they just finished a workout "
-        "or synced their watch."
+        "down with the other tools. Dates are YYYY-MM-DD in the user's timezone. Health data refreshes "
+        "hourly and new workouts are pulled within ~10 minutes of syncing the watch; call "
+        "sync_now if the user just finished a workout and it isn't there yet."
     ),
 )
 
@@ -74,6 +75,9 @@ def _status() -> dict:
         "last_sync_utc": store.get_meta("last_sync_utc"),
         "last_sync_error": syncer.last_error,
         "timezone": TZ,
+        "history_target_days": BACKFILL_DAYS,
+        "history_backfill_complete": int(store.get_meta("backfill_done_days") or 0) >= BACKFILL_DAYS,
+        "workouts_awaiting_details": store.count_missing_details(),
         **store.counts(),
     }
 
@@ -160,16 +164,23 @@ def get_recent_activities(limit: int = 10, activity_type: str | None = None,
 
 
 @mcp.tool()
-async def get_activity_details(activity_id: int) -> dict:
-    """Full detail for one workout: summary, per-lap splits (pace/HR/cadence/power) and
-    time in each HR zone. Get IDs from get_recent_activities."""
+async def get_activity_details(activity_id: int, include_raw: bool = False) -> dict:
+    """Everything about one workout: summary, per-lap splits (pace/HR/cadence/power),
+    time in HR and power zones, running dynamics, stamina, RPE/feel, training-effect
+    messages, strength sets (exercise/reps/weight), weather, personal records.
+    include_raw=True adds Garmin's raw JSON (incl. interval/workout-step splits).
+    Get IDs from get_recent_activities."""
     a = store.get_activity(activity_id)
     if a is None:
         return {"error": f"Activity {activity_id} not found. Try sync_now."}
     details = a["details"]
     if details is None:
         details = await anyio.to_thread.run_sync(syncer.fetch_activity_details, activity_id)
-    return {"summary": a["summary"], **details}
+    raw = details.pop("_raw", None)
+    out = {"summary": a["summary"], **details}
+    if include_raw and raw:
+        out["raw"] = trim(raw)
+    return out
 
 
 @mcp.tool()
@@ -186,8 +197,8 @@ def get_raw_garmin_data(day: str, kind: str) -> Any:
 
 @mcp.tool()
 async def sync_now() -> dict:
-    """Pull the latest data from Garmin right now (today, yesterday, new workouts).
-    Use when the user just finished a workout or synced their watch."""
+    """Pull the latest data from Garmin right now (today, yesterday, new workouts with
+    full details). New workouts are also picked up automatically within ~10 minutes."""
     try:
         res = await anyio.to_thread.run_sync(syncer.sync_recent)
         return {"ok": True, **res, "status": _status()}
@@ -236,7 +247,7 @@ def main() -> None:
         transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
     )
     if os.getenv("DISABLE_SYNC") != "1":
-        threading.Thread(target=syncer.run_forever, args=(SYNC_INTERVAL_MIN, BACKFILL_DAYS),
+        threading.Thread(target=syncer.run_forever, args=(SYNC_INTERVAL_MIN, POLL_MIN, BACKFILL_DAYS),
                          daemon=True).start()
     port = int(os.getenv("PORT", "8000"))
     log.info("MCP endpoint ready at http://0.0.0.0:%s/mcp/<MCP_SECRET>", port)

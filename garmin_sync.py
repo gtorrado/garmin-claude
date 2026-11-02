@@ -244,6 +244,81 @@ def extract_laps(splits: Any) -> list[dict]:
     return out
 
 
+def extract_activity_extras(full: Any) -> dict:
+    """Metrics only in the full activity record (not the list view)."""
+    s = g(full, "summaryDTO", default={}) or {}
+    return clean({
+        "aerobic_te_message": s.get("aerobicTrainingEffectMessage"),
+        "anaerobic_te_message": s.get("anaerobicTrainingEffectMessage"),
+        "training_effect_label": s.get("trainingEffectLabel"),
+        "perceived_effort_rpe_1_10": s["directWorkoutRpe"] / 10 if isinstance(s.get("directWorkoutRpe"), (int, float)) else None,
+        "feel_0_100": s.get("directWorkoutFeel"),  # 0 = very weak … 100 = very strong
+        "grade_adjusted_pace": pace_min_per_km(s.get("avgGradeAdjustedSpeed")),
+        "avg_moving_pace": pace_min_per_km(s.get("averageMovingSpeed")),
+        "stamina_start_pct": s.get("beginPotentialStamina"),
+        "stamina_end_pct": s.get("endPotentialStamina"),
+        "stamina_min_pct": s.get("minAvailableStamina"),
+        "avg_respiration": s.get("avgRespirationRate"),
+        "max_respiration": s.get("maxRespirationRate"),
+        "ground_contact_ms": s.get("groundContactTime"),
+        "stride_length_cm": s.get("strideLength"),
+        "vertical_oscillation_cm": s.get("verticalOscillation"),
+        "vertical_ratio_pct": s.get("verticalRatio"),
+        "gct_balance": s.get("groundContactBalanceLeft") or s.get("avgGroundContactBalance"),
+        "max_power_w": s.get("maxPower"),
+        "normalized_power_w": s.get("normalizedPower"),
+        "intensity_factor": s.get("intensityFactor"),
+        "tss": s.get("trainingStressScore"),
+        "max_cadence": s.get("maxRunCadence") or s.get("maxBikeCadence"),
+        "elevation_loss_m": s.get("elevationLoss"),
+        "min_elevation_m": s.get("minElevation"),
+        "max_elevation_m": s.get("maxElevation"),
+        "sweat_loss_ml": s.get("waterEstimated"),
+        "min_temp_c": s.get("minTemperature"),
+        "max_temp_c": s.get("maxTemperature"),
+        "location": g(full, "locationName"),
+        "description": g(full, "description"),
+    })
+
+
+def extract_zones(zones: Any) -> list[dict]:
+    return [
+        clean({"zone": z.get("zoneNumber"), "from": z.get("zoneLowBoundary"),
+               "minutes": mins(z.get("secsInZone"))})
+        for z in (zones or []) if isinstance(z, dict)
+    ]
+
+
+def extract_sets(sets: Any) -> list[dict]:
+    out = []
+    for st in g(sets, "exerciseSets", default=[]) or []:
+        if st.get("setType") != "ACTIVE":
+            continue
+        ex = (st.get("exercises") or [{}])[0]
+        weight = st.get("weight")
+        out.append(clean({
+            "exercise": "/".join(x for x in (ex.get("category"), ex.get("name")) if x) or None,
+            "reps": st.get("repetitionCount"),
+            "weight_kg": round(weight / 1000, 1) if isinstance(weight, (int, float)) and weight > 0 else None,
+            "duration_s": round(st["duration"]) if isinstance(st.get("duration"), (int, float)) else None,
+        }))
+    return out
+
+
+def extract_weather(w: Any) -> dict:
+    if not isinstance(w, dict):
+        return {}
+    temp_f = w.get("temp")
+    return clean({
+        "temp_c": round((temp_f - 32) * 5 / 9, 1) if isinstance(temp_f, (int, float)) else None,
+        "feels_like_c": round((w["apparentTemp"] - 32) * 5 / 9, 1)
+        if isinstance(w.get("apparentTemp"), (int, float)) else None,
+        "humidity_pct": w.get("relativeHumidity"),
+        "wind_kmh": round(w["windSpeed"] * 1.609, 1) if isinstance(w.get("windSpeed"), (int, float)) else None,
+        "conditions": g(w, "weatherTypeDTO", "desc"),
+    })
+
+
 # ---------------------------------------------------------------------------
 # Syncer
 # ---------------------------------------------------------------------------
@@ -340,29 +415,49 @@ class GarminSyncer:
             self.store.put_activity(s["id"], s.get("start_local", ""), s.get("type", ""), s, a)
         return len(acts)
 
+    # -- workouts --------------------------------------------------------
+    def _try(self, what: str, fn: Callable[[Garmin], Any]) -> Any:
+        try:
+            return self._call(fn)
+        except GarminConnectAuthenticationError:
+            raise
+        except Exception as e:  # noqa: BLE001 - not every workout has every detail
+            log.debug("%s unavailable: %s", what, e)
+            return None
+
     def fetch_activity_details(self, act_id: int) -> dict:
-        splits = hr = None
-        try:
-            splits = self._call(lambda c: c.get_activity_splits(str(act_id)))
-        except Exception as e:  # noqa: BLE001
-            log.info("splits %s unavailable: %s", act_id, e)
-        try:
-            hr = self._call(lambda c: c.get_activity_hr_in_timezones(str(act_id)))
-        except Exception as e:  # noqa: BLE001
-            log.info("hr zones %s unavailable: %s", act_id, e)
+        """Everything Garmin has for one workout, compacted + raw kept for the escape hatch."""
+        aid = str(act_id)
+        full = self._try(f"activity {aid}", lambda c: c.get_activity(aid))
+        splits = self._try(f"splits {aid}", lambda c: c.get_activity_splits(aid))
+        typed = self._try(f"typed splits {aid}", lambda c: c.get_activity_typed_splits(aid))
+        hr = self._try(f"hr zones {aid}", lambda c: c.get_activity_hr_in_timezones(aid))
+        power = self._try(f"power zones {aid}", lambda c: c.get_activity_power_in_timezones(aid))
+        weather = self._try(f"weather {aid}", lambda c: c.get_activity_weather(aid))
+        prs = self._try(f"PRs {aid}", lambda c: c.get_personal_records_for_activity(aid))
+        sets = None
+        a_type = (g(full, "activityTypeDTO", "typeKey") or "")
+        if "strength" in a_type or "fitness" in a_type or "training" in a_type or a_type == "":
+            sets = self._try(f"sets {aid}", lambda c: c.get_activity_exercise_sets(aid))
+
         details = clean({
+            "extra_metrics": extract_activity_extras(full),
             "laps": extract_laps(splits),
-            "hr_zones": [
-                clean({"zone": z.get("zoneNumber"), "min_bpm": z.get("zoneLowBoundary"),
-                       "minutes": mins(z.get("secsInZone"))})
-                for z in (hr or []) if isinstance(z, dict)
-            ],
+            "hr_zones": extract_zones(hr),
+            "power_zones": extract_zones(power),
+            "exercise_sets": extract_sets(sets),
+            "weather": extract_weather(weather),
+            "personal_records": [clean({"type_id": r.get("typeId"), "value": r.get("value")})
+                                 for r in (prs or []) if isinstance(r, dict)],
+            "_raw": clean({"activity": full, "splits": splits, "typed_splits": typed,
+                           "weather": weather, "exercise_sets": sets}),
         })
         self.store.put_activity_details(act_id, details)
         return details
 
-    def sync_recent(self, days: int = 2, detail_limit: int = 10) -> dict:
-        """Refresh the last `days` days + new activities. Used by the scheduler and sync_now."""
+    # -- sync jobs -------------------------------------------------------
+    def sync_recent(self, days: int = 2, detail_limit: int = 20) -> dict:
+        """Refresh the last `days` days + new workouts (with full details)."""
         with self._lock:
             today = self.today()
             for i in range(days):
@@ -379,33 +474,72 @@ class GarminSyncer:
             self.last_error = None
             return {"days_refreshed": days, "activities_seen": n}
 
+    def new_workout_waiting(self) -> bool:
+        """Cheap check (1 request): is there a workout on Garmin we haven't stored?"""
+        acts = self._call(lambda c: c.get_activities(0, 1)) or []
+        if isinstance(acts, dict):
+            acts = acts.get("activityList") or []
+        return bool(acts) and self.store.get_activity(acts[0].get("activityId")) is None
+
     def backfill(self, days: int) -> None:
-        """Fill history for days we don't have yet (oldest last, so recent data lands first)."""
+        """Fill history newest → oldest. Resumable: days already stored are skipped."""
         today = self.today()
+        self.store.set_meta("backfill_target_days", str(days))
         for i in range(days):
             day = today - timedelta(days=i)
             if i >= 2 and self.store.has_day(day.isoformat()):
                 continue
             self.sync_day(day)
+            if i % 30 == 0:
+                log.info("Backfill: health history back to %s", day)
+                self._save_tokens()
+        log.info("Backfill: listing workouts for the last %s days", days)
         self.sync_activities(today - timedelta(days=days))
+        todo = self.store.activity_ids_without_details(100_000)
+        for n, act_id in enumerate(todo, 1):
+            self.fetch_activity_details(act_id)
+            if n % 25 == 0:
+                log.info("Backfill: workout details %s/%s", n, len(todo))
+                self._save_tokens()
         self._save_tokens()
         self.store.set_meta("backfill_done_days", str(days))
 
-    def run_forever(self, interval_min: int, backfill_days: int) -> None:
-        """Background loop: initial backfill, then refresh every `interval_min` minutes."""
+    def _guard(self, name: str, fn: Callable[[], Any]) -> None:
         try:
-            self.sync_recent()
-            if int(self.store.get_meta("backfill_done_days") or 0) < backfill_days:
-                log.info("Backfilling %s days of history…", backfill_days)
-                self.backfill(backfill_days)
-                log.info("Backfill complete")
+            fn()
         except Exception as e:  # noqa: BLE001
-            self.last_error = f"{type(e).__name__}: {e}"
-            log.exception("Initial sync failed")
-        while True:
-            time.sleep(interval_min * 60)
+            self.last_error = f"{name}: {type(e).__name__}: {e}"
+            log.exception("%s failed", name)
+
+    def run_backfill(self, days: int) -> None:
+        if int(self.store.get_meta("backfill_done_days") or 0) >= days:
+            return
+        while True:  # retry until the whole history is in (e.g. after rate limits)
+            log.info("Backfilling %s days of history…", days)
             try:
-                self.sync_recent()
+                self.backfill(days)
+                log.info("Backfill complete")
+                return
             except Exception as e:  # noqa: BLE001
-                self.last_error = f"{type(e).__name__}: {e}"
-                log.exception("Scheduled sync failed")
+                self.last_error = f"backfill: {type(e).__name__}: {e}"
+                log.exception("Backfill interrupted, retrying in 15 min")
+                time.sleep(900)
+
+    def run_forever(self, interval_min: int, poll_min: int, backfill_days: int) -> None:
+        """Refresh everything every `interval_min`; check for a new workout every `poll_min`
+        and sync it straight away. History backfill runs in its own thread."""
+        self._guard("initial sync", self.sync_recent)
+        threading.Thread(target=self.run_backfill, args=(backfill_days,), daemon=True).start()
+        last_full = time.monotonic()
+        while True:
+            time.sleep(poll_min * 60)
+            if time.monotonic() - last_full >= interval_min * 60:
+                self._guard("scheduled sync", self.sync_recent)
+                last_full = time.monotonic()
+                continue
+
+            def check() -> None:
+                if self.new_workout_waiting():
+                    log.info("New workout detected, syncing")
+                    self.sync_recent()
+            self._guard("workout check", check)

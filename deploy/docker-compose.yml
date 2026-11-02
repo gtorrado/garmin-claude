@@ -1,0 +1,21 @@
+# For a cheap/free VPS (Oracle Cloud Always Free, Hetzner, …). Caddy adds HTTPS automatically.
+services:
+  garmin:
+    build: ..
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATA_DIR: /data
+    volumes:
+      - ./data:/data
+  caddy:
+    image: caddy:2.8
+    restart: unless-stopped
+    ports: ["80:80", "443:443"]
+    environment:
+      DOMAIN: ${DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+volumes:
+  caddy_data:

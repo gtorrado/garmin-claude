@@ -13,11 +13,13 @@ Ask things like *"How recovered am I today?"*, *"Was yesterday's run too hard gi
 | `get_daily_metrics` | Steps, resting HR, stress, Body Battery, sleep stages/score, HRV, training readiness, training status/load, VO2 max, weight |
 | `get_trends` | Any metric day-by-day over up to 2 years, with avg/min/max |
 | `get_recent_activities` | Workouts: distance, pace, HR, zones, training effect, load |
-| `get_activity_details` | Per-lap splits and HR-zone time for one workout |
+| `get_activity_details` | Everything for one workout: laps, HR & power zones, running dynamics, stamina, RPE/feel, training-effect messages, strength sets (exercise/reps/kg), weather, PRs |
 | `sync_now` / `sync_day` | Pull fresh data from Garmin on demand |
 | `get_raw_garmin_data` | Raw Garmin JSON for anything not in the summaries |
 
-It syncs automatically every hour and backfills 90 days of history on first start.
+- **History:** backfills **2 years** on first start (takes a few hours in the background; recent data is available within minutes). Resumes where it left off after restarts.
+- **After training:** checks for a new workout every 10 minutes and pulls it with full details as soon as your watch syncs.
+- **Health metrics:** refreshed every hour.
 
 ## Setup (≈15 minutes)
 
@@ -29,7 +31,24 @@ python login.py
 ```
 Copy the long `{"di_token": ...}` line it prints.
 
-### 2. Deploy to Railway (or any Docker host)
+### 2. Host it — pick one
+
+| Option | Cost | Effort |
+|---|---|---|
+| **A. Oracle Cloud Always Free VM** | **€0** | ~30 min, needs a card at signup (not charged) |
+| B. Hetzner CX22 VPS (EU) | ~€4/mo | ~15 min |
+| C. Railway | ~$5/mo | ~10 min, all clicks |
+
+#### A / B — VPS (free or ~€4)
+1. Create an **Ubuntu** VM (Oracle: *Compute → Instances → Create*, shape `VM.Standard.A1.Flex` 1 OCPU / 6 GB, "Always Free"; then in the VCN's security list add ingress TCP 80 and 443 from `0.0.0.0/0`).
+2. SSH in, then:
+   ```bash
+   git clone <your-private-repo-url> garmin-claude && cd garmin-claude
+   bash deploy/setup-vps.sh
+   ```
+3. Paste your token when asked. It prints your connector URL. Done.
+
+#### C — Railway
 1. Push this folder to a **private** GitHub repo.
 2. On [railway.com](https://railway.com): **New Project → Deploy from GitHub repo** → pick it.
 3. On the service: **Settings → Volumes → Add volume**, mount path `/data`.
@@ -38,7 +57,7 @@ Copy the long `{"di_token": ...}` line it prints.
    |---|---|
    | `GARMIN_TOKENS` | the line from step 1 |
    | `MCP_SECRET` | a long random string, e.g. output of `python -c "import secrets;print(secrets.token_urlsafe(32))"` |
-   | `TZ_NAME` | your timezone, e.g. `Europe/Madrid` |
+   | `TZ_NAME` | `Europe/Lisbon` (default; same clock as the UK) |
 5. **Settings → Networking → Generate Domain**.
 6. Check `https://<your-domain>/health` returns `{"ok": true, ...}`.
 
@@ -54,7 +73,8 @@ It then shows up in the browser and the mobile app. Tip: create a Claude Project
 | Variable | Default | |
 |---|---|---|
 | `SYNC_INTERVAL_MIN` | `60` | How often to refresh |
-| `BACKFILL_DAYS` | `90` | History pulled on first start (more = slower first sync) |
+| `BACKFILL_DAYS` | `730` | History pulled on first start |
+| `WORKOUT_POLL_MIN` | `10` | How often to check for a new workout |
 | `GARMIN_CALL_DELAY` | `0.4` | Pause between Garmin requests |
 
 ## Security notes
@@ -65,5 +85,5 @@ It then shows up in the browser and the mobile app. Tip: create a Claude Project
 ## Run locally
 ```bash
 pip install -r requirements.txt
-GARMIN_TOKENS='...' MCP_SECRET=$(python -c "import secrets;print(secrets.token_urlsafe(32))") TZ_NAME=Europe/Madrid python server.py
+GARMIN_TOKENS='...' MCP_SECRET=$(python -c "import secrets;print(secrets.token_urlsafe(32))") python server.py
 ```
