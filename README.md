@@ -46,7 +46,9 @@ Copy the long `{"di_token": ...}` line it prints.
    git clone <your-private-repo-url> garmin-claude && cd garmin-claude
    bash deploy/setup-vps.sh
    ```
-3. Paste your token when asked. It prints your connector URL. Done.
+3. It asks for your Garmin email, password and 2FA code (one time, nothing is stored but the login token), then prints your connector URL. Done.
+
+(Step 1 above is only needed for Railway.)
 
 #### C — Railway
 1. Push this folder to a **private** GitHub repo.

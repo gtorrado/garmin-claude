@@ -19,10 +19,8 @@ IP=$(curl -fsS https://api.ipify.org)
 DOMAIN="${IP//./-}.sslip.io"   # free hostname that points at this server
 
 if [ ! -f .env ]; then
-  read -rp "Paste your GARMIN_TOKENS (from login.py): " TOKENS
   SECRET=$(openssl rand -hex 24)
   cat > .env <<ENV
-GARMIN_TOKENS=$TOKENS
 MCP_SECRET=$SECRET
 TZ_NAME=Europe/Lisbon
 DOMAIN=$DOMAIN
@@ -30,6 +28,16 @@ ENV
   chmod 600 .env
 fi
 set -a; . ./.env; set +a
+mkdir -p data
+
+if [ ! -f data/garmin_tokens.json ] && [ -z "${GARMIN_TOKENS:-}" ]; then
+  echo
+  echo "=== Garmin login (one time) ==="
+  sudo docker compose --env-file .env build garmin
+  until sudo docker compose --env-file .env run --rm garmin python login.py --save /data/garmin_tokens.json; do
+    echo "Login failed — let's try again (Ctrl+C to stop)."
+  done
+fi
 
 sudo docker compose --env-file .env up -d --build
 echo
