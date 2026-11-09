@@ -40,7 +40,8 @@ def g(d: Any, *path: Any, default: Any = None) -> Any:
 
 def clean(d: dict) -> dict:
     """Drop None values so the output Claude reads stays compact."""
-    return {k: v for k, v in d.items() if v is not None and v != {} and v != []}
+    return {k: (round(v, 2) if isinstance(v, float) else v)
+            for k, v in d.items() if v is not None and v != {} and v != []}
 
 
 def mins(seconds: Any) -> float | None:
@@ -54,8 +55,8 @@ def hours(seconds: Any) -> float | None:
 def pace_min_per_km(speed_mps: Any) -> str | None:
     if not isinstance(speed_mps, (int, float)) or speed_mps <= 0:
         return None
-    secs = 1000 / speed_mps
-    return f"{int(secs // 60)}:{int(round(secs % 60)):02d}/km"
+    secs = round(1000 / speed_mps)
+    return f"{secs // 60}:{secs % 60:02d}/km"
 
 
 def first_device_value(d: Any) -> Any:
@@ -340,6 +341,7 @@ class GarminSyncer:
         self._lock = threading.RLock()  # one Garmin call at a time
         self.last_error: str | None = None
         self.call_delay = float(os.getenv("GARMIN_CALL_DELAY", "0.4"))
+        self.after_sync: list[Callable[[], Any]] = []  # e.g. calendar cache refresh
 
     # -- auth ------------------------------------------------------------
     def today(self) -> date:
@@ -472,6 +474,11 @@ class GarminSyncer:
             self._save_tokens()
             self.store.set_meta("last_sync_utc", datetime.now(timezone.utc).isoformat(timespec="seconds"))
             self.last_error = None
+            for hook in self.after_sync:
+                try:
+                    hook()
+                except Exception as e:  # noqa: BLE001
+                    log.warning("after-sync hook failed: %s", e)
             return {"days_refreshed": days, "activities_seen": n}
 
     def new_workout_waiting(self) -> bool:

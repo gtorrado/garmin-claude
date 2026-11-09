@@ -15,6 +15,10 @@ Ask things like *"How recovered am I today?"*, *"Was yesterday's run too hard gi
 | `get_recent_activities` | Workouts: distance, pace, HR, zones, training effect, load |
 | `get_activity_details` | Everything for one workout: laps, HR & power zones, running dynamics, stamina, RPE/feel, training-effect messages, strength sets (exercise/reps/kg), weather, PRs |
 | `sync_now` / `sync_day` | Pull fresh data from Garmin on demand |
+| `get_training_calendar` | Planned workouts (incl. Garmin Coach / adaptive plans), races, events and completed workouts, by day |
+| `get_planned_workout` | Step-by-step structure of a planned session (targets, repeats) |
+| `get_training_plan` | Active training plan(s) and progress |
+| `get_races` | Upcoming races, focus race, race-time predictions |
 | `get_raw_garmin_data` | Raw Garmin JSON for anything not in the summaries |
 
 - **History:** backfills **2 years** on first start (takes a few hours in the background; recent data is available within minutes). Resumes where it left off after restarts.
@@ -70,6 +74,12 @@ claude.ai → **Settings → Connectors → Add custom connector**
 
 It then shows up in the browser and the mobile app. Tip: create a Claude Project
 ("Training coach") with instructions like *"Always check my Garmin data before answering."*
+
+## Updating the server
+```bash
+bash ~/garmin-claude/deploy/update.sh
+```
+The first run walks you through adding a read-only GitHub deploy key.
 
 ## Optional settings
 | Variable | Default | |
