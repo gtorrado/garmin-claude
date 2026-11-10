@@ -20,6 +20,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+import hashlib
 import json
 
 import calendar_tools as cal
@@ -52,9 +53,10 @@ mcp = MCPServer(
         "hourly and new workouts are pulled within ~10 minutes of syncing the watch; call "
         "sync_now if the user just finished a workout and it isn't there yet. "
         "Write tools (schedule_strength_workout, schedule_hevy_workout, remove_created_workout) "
-        "change the user's Garmin calendar: always run them with dry_run=true first, show the "
-        "preview (especially exercise matches marked close/category/unmatched) and only call "
-        "again with dry_run=false after the user confirms."
+        "change the user's Garmin calendar: in a conversation, run them with dry_run=true first, "
+        "show the preview (especially exercise matches marked close/category/unmatched) and only "
+        "call again with dry_run=false after the user confirms. The user's own scheduled "
+        "automation task may call them directly with dry_run=false."
     ),
 )
 
@@ -246,25 +248,51 @@ def _created() -> list[dict]:
     return json.loads(store.get_meta("created_workouts") or "[]")
 
 
+def _remove_created(rec: dict) -> None:
+    if rec.get("scheduled_workout_id"):
+        try:
+            syncer._call(lambda c: c.unschedule_workout(rec["scheduled_workout_id"]))
+        except Exception:  # noqa: BLE001 - deleting the template removes it anyway
+            pass
+    try:
+        syncer._call(lambda c: c.delete_workout(rec["workout_id"]))
+    except Exception as e:  # noqa: BLE001
+        log.warning("delete workout %s failed: %s", rec.get("workout_id"), e)
+    store.set_meta("created_workouts", json.dumps([r for r in _created() if r != rec]))
+
+
 def _upload_and_schedule(name: str, day: str, exercises: list[dict], description: str | None,
-                         dry_run: bool) -> dict:
+                         dry_run: bool, source_event_id: str | None = None) -> dict:
     d = _resolve_date(day)
+    fingerprint = hashlib.sha1(json.dumps([name, d, exercises, description], sort_keys=True,
+                                          default=str).encode()).hexdigest()[:16]
+    previous = next((r for r in _created() if source_event_id
+                     and r.get("source_event_id") == source_event_id), None)
+    if previous and previous.get("fingerprint") == fingerprint:
+        return {"unchanged": True, **previous,
+                "note": "Already in the Garmin calendar exactly like this; nothing to do."}
     workout, report, est = st.build_workout(name, exercises, description, st.load_overrides(store))
     preview = {
         "name": name, "date": d, "estimated_duration_min": round(est / 60),
         "exercises": st.preview_lines(exercises, report),
         "needs_attention": [r for r in report if r["confidence"] in ("category", "unmatched", "close")],
     }
+    if previous:
+        preview["replaces"] = previous
     if dry_run:
         return {"dry_run": True, **preview,
                 "next": "Show this to the user. Fix matches with garmin_exercise (see "
                         "find_garmin_exercises) or save_exercise_mapping, then call again with "
                         "dry_run=false."}
+    if previous:  # the source event changed: replace the old Garmin workout
+        _remove_created(previous)
     up = syncer._call(lambda c: c.upload_strength_workout(workout))
     wid = up.get("workoutId")
     sch = syncer._call(lambda c: c.schedule_workout(wid, d)) or {}
     sid = sch.get("workoutScheduleId") or g_id(sch)
-    rec = {"workout_id": wid, "scheduled_workout_id": sid, "date": d, "name": name}
+    rec = {"workout_id": wid, "scheduled_workout_id": sid, "date": d, "name": name,
+           "source_event_id": source_event_id, "fingerprint": fingerprint}
+    rec = {k: v for k, v in rec.items() if v is not None}
     store.set_meta("created_workouts", json.dumps(_created() + [rec]))
     return {"created": True, **rec, **preview,
             "note": "It's in the Garmin calendar now; the watch picks it up on its next sync."}
@@ -280,7 +308,8 @@ def g_id(sch: dict) -> Any:
 @mcp.tool()
 async def schedule_strength_workout(name: str, date: str, exercises: list[dict],
                                     description: str | None = None,
-                                    dry_run: bool = True) -> dict:
+                                    dry_run: bool = True,
+                                    source_event_id: str | None = None) -> dict:
     """Create a structured strength workout in Garmin Connect and put it on the calendar
     (it then syncs to the watch, which guides each set/rep/weight/rest).
     exercises: [{"name": "Bench Press (Barbell)", "rest_seconds": 120, "notes": "...",
@@ -290,9 +319,11 @@ async def schedule_strength_workout(name: str, date: str, exercises: list[dict],
                          or shorthand "sets": 4, "reps": 8, "weight_kg": 60}]
     Timed sets: {"duration_seconds": 45}. Names are auto-matched to Garmin's exercise list.
     Follow the naming style of the user's other calendar workouts when sensible.
-    ALWAYS dry_run=true first and get the user's OK."""
+    source_event_id: the Google Calendar event this comes from. Makes it idempotent: same
+    content → 'unchanged'; changed event (moved/edited) → the old Garmin workout is replaced.
+    In a chat: ALWAYS dry_run=true first and get the user's OK."""
     return await anyio.to_thread.run_sync(_upload_and_schedule, name, date, exercises,
-                                          description, dry_run)
+                                          description, dry_run, source_event_id)
 
 
 @mcp.tool()
@@ -359,17 +390,29 @@ async def remove_created_workout(scheduled_workout_id: int | None = None,
         return {"error": "Not a workout created by this connector.", "created_workouts": created}
     if dry_run:
         return {"dry_run": True, "would_remove": rec}
-
-    def go() -> None:
-        if rec.get("scheduled_workout_id"):
-            try:
-                syncer._call(lambda c: c.unschedule_workout(rec["scheduled_workout_id"]))
-            except Exception:  # noqa: BLE001 - deleting the template removes it anyway
-                pass
-        syncer._call(lambda c: c.delete_workout(rec["workout_id"]))
-    await anyio.to_thread.run_sync(go)
-    store.set_meta("created_workouts", json.dumps([r for r in created if r is not rec and r != rec]))
+    await anyio.to_thread.run_sync(_remove_created, rec)
     return {"removed": rec}
+
+
+@mcp.tool()
+def get_logged_sessions(since: str | None = None) -> list[dict]:
+    """Strength sessions the automation already logged to Google Calendar (so they're not
+    logged twice): activity ids, Hevy ids, calendar event ids."""
+    rows = json.loads(store.get_meta("logged_sessions") or "[]")
+    return [r for r in rows if not since or (r.get("date") or "") >= since]
+
+
+@mcp.tool()
+def mark_session_logged(date: str, google_event_id: str, garmin_activity_id: int | None = None,
+                        hevy_workout_id: str | None = None, note: str | None = None) -> dict:
+    """Record that a completed session was written into its Google Calendar event."""
+    rows = json.loads(store.get_meta("logged_sessions") or "[]")
+    rec = {k: v for k, v in {"date": _resolve_date(date), "google_event_id": google_event_id,
+                             "garmin_activity_id": garmin_activity_id,
+                             "hevy_workout_id": hevy_workout_id, "note": note}.items() if v is not None}
+    rows = [r for r in rows if r.get("google_event_id") != google_event_id] + [rec]
+    store.set_meta("logged_sessions", json.dumps(rows[-500:]))
+    return {"saved": True, **rec}
 
 
 @mcp.tool()
