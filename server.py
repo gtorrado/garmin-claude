@@ -23,6 +23,7 @@ from starlette.responses import JSONResponse
 import json
 
 import calendar_tools as cal
+import strength_tools as st
 from garmin_sync import GarminSyncer, trim
 from store import Store
 
@@ -49,7 +50,11 @@ mcp = MCPServer(
         "user's health, recovery, sleep or training, start with get_coach_briefing, then drill "
         "down with the other tools. Dates are YYYY-MM-DD in the user's timezone. Health data refreshes "
         "hourly and new workouts are pulled within ~10 minutes of syncing the watch; call "
-        "sync_now if the user just finished a workout and it isn't there yet."
+        "sync_now if the user just finished a workout and it isn't there yet. "
+        "Write tools (schedule_strength_workout, schedule_hevy_workout, remove_created_workout) "
+        "change the user's Garmin calendar: always run them with dry_run=true first, show the "
+        "preview (especially exercise matches marked close/category/unmatched) and only call "
+        "again with dry_run=false after the user confirms."
     ),
 )
 
@@ -232,6 +237,139 @@ async def get_races() -> dict:
     """Upcoming races/events from the Garmin calendar (incl. the primary 'focus' race,
     goal times) and Garmin's current race-time predictions (5K, 10K, half, marathon)."""
     return await anyio.to_thread.run_sync(cal.upcoming_races, syncer)
+
+
+# ---------------------------------------------------------------------------
+# Strength workouts → Garmin calendar
+# ---------------------------------------------------------------------------
+def _created() -> list[dict]:
+    return json.loads(store.get_meta("created_workouts") or "[]")
+
+
+def _upload_and_schedule(name: str, day: str, exercises: list[dict], description: str | None,
+                         dry_run: bool) -> dict:
+    d = _resolve_date(day)
+    workout, report, est = st.build_workout(name, exercises, description, st.load_overrides(store))
+    preview = {
+        "name": name, "date": d, "estimated_duration_min": round(est / 60),
+        "exercises": st.preview_lines(exercises, report),
+        "needs_attention": [r for r in report if r["confidence"] in ("category", "unmatched", "close")],
+    }
+    if dry_run:
+        return {"dry_run": True, **preview,
+                "next": "Show this to the user. Fix matches with garmin_exercise (see "
+                        "find_garmin_exercises) or save_exercise_mapping, then call again with "
+                        "dry_run=false."}
+    up = syncer._call(lambda c: c.upload_strength_workout(workout))
+    wid = up.get("workoutId")
+    sch = syncer._call(lambda c: c.schedule_workout(wid, d)) or {}
+    sid = sch.get("workoutScheduleId") or g_id(sch)
+    rec = {"workout_id": wid, "scheduled_workout_id": sid, "date": d, "name": name}
+    store.set_meta("created_workouts", json.dumps(_created() + [rec]))
+    return {"created": True, **rec, **preview,
+            "note": "It's in the Garmin calendar now; the watch picks it up on its next sync."}
+
+
+def g_id(sch: dict) -> Any:
+    for k in ("id", "scheduleId", "calendarItemId"):
+        if sch.get(k):
+            return sch[k]
+    return None
+
+
+@mcp.tool()
+async def schedule_strength_workout(name: str, date: str, exercises: list[dict],
+                                    description: str | None = None,
+                                    dry_run: bool = True) -> dict:
+    """Create a structured strength workout in Garmin Connect and put it on the calendar
+    (it then syncs to the watch, which guides each set/rep/weight/rest).
+    exercises: [{"name": "Bench Press (Barbell)", "rest_seconds": 120, "notes": "...",
+                 "superset": "A" (optional: consecutive exercises with the same key alternate),
+                 "garmin_exercise": "Barbell Bench Press" or "BENCH_PRESS/BARBELL_BENCH_PRESS" (optional),
+                 "sets": [{"reps": 8, "weight_kg": 60, "type": "warmup|normal"}, ...]
+                         or shorthand "sets": 4, "reps": 8, "weight_kg": 60}]
+    Timed sets: {"duration_seconds": 45}. Names are auto-matched to Garmin's exercise list.
+    Follow the naming style of the user's other calendar workouts when sensible.
+    ALWAYS dry_run=true first and get the user's OK."""
+    return await anyio.to_thread.run_sync(_upload_and_schedule, name, date, exercises,
+                                          description, dry_run)
+
+
+@mcp.tool()
+def find_garmin_exercises(query: str) -> list[dict]:
+    """Search Garmin's strength-exercise list (1,500+ exercises), e.g. 'hip thrust',
+    'cable row'. Use the returned name or id as garmin_exercise."""
+    return st.search_exercises(query)
+
+
+@mcp.tool()
+def save_exercise_mapping(source_name: str, garmin_exercise: str) -> dict:
+    """Remember that an exercise name (e.g. Hevy's 'Hip Thrust (Barbell)') should always map
+    to a Garmin exercise (display name or CATEGORY/EXERCISE id)."""
+    r = st.resolve_garmin(garmin_exercise)
+    if not r:
+        return {"error": "Unknown Garmin exercise — use find_garmin_exercises."}
+    m = st.load_overrides(store)
+    m[source_name.strip().lower()] = garmin_exercise
+    store.set_meta("exercise_map", json.dumps(m))
+    return {"saved": True, "source": source_name, **r}
+
+
+@mcp.tool()
+async def list_hevy(kind: str = "routines", page: int = 1) -> dict:
+    """List the user's Hevy routines (kind='routines') or logged workouts (kind='workouts'),
+    10 per page, with their exercises. Requires HEVY_API_KEY on the server (Hevy Pro)."""
+    if kind not in ("routines", "workouts"):
+        return {"error": "kind must be 'routines' or 'workouts'"}
+    try:
+        return await anyio.to_thread.run_sync(st.hevy_list, kind, page)
+    except Exception as e:  # noqa: BLE001
+        return {"error": str(e)}
+
+
+@mcp.tool()
+async def schedule_hevy_workout(hevy_id: str, date: str, kind: str = "routines",
+                                name: str | None = None, dry_run: bool = True) -> dict:
+    """Convert a Hevy routine (or a past logged Hevy workout, kind='workouts') into a Garmin
+    strength workout and schedule it on `date` — sets, reps, weights, rest and supersets kept.
+    IDs from list_hevy. ALWAYS dry_run=true first and get the user's OK."""
+    if kind not in ("routines", "workouts"):
+        return {"error": "kind must be 'routines' or 'workouts'"}
+    try:
+        h = await anyio.to_thread.run_sync(st.hevy_get, kind, hevy_id)
+    except Exception as e:  # noqa: BLE001
+        return {"error": str(e)}
+    exs = st.hevy_to_exercises(h)
+    return await anyio.to_thread.run_sync(_upload_and_schedule, name or h.get("title") or "Strength",
+                                          date, exs, h.get("notes") or h.get("description"), dry_run)
+
+
+@mcp.tool()
+async def remove_created_workout(scheduled_workout_id: int | None = None,
+                                 workout_id: int | None = None, dry_run: bool = True) -> dict:
+    """Remove a workout that THIS connector created (unschedule + delete its template).
+    Workouts from Runna, Garmin Coach etc. are never touched. Lists created workouts when
+    called without IDs."""
+    created = _created()
+    if not scheduled_workout_id and not workout_id:
+        return {"created_workouts": created}
+    rec = next((r for r in created if (scheduled_workout_id and r.get("scheduled_workout_id") == scheduled_workout_id)
+                or (workout_id and r.get("workout_id") == workout_id)), None)
+    if not rec:
+        return {"error": "Not a workout created by this connector.", "created_workouts": created}
+    if dry_run:
+        return {"dry_run": True, "would_remove": rec}
+
+    def go() -> None:
+        if rec.get("scheduled_workout_id"):
+            try:
+                syncer._call(lambda c: c.unschedule_workout(rec["scheduled_workout_id"]))
+            except Exception:  # noqa: BLE001 - deleting the template removes it anyway
+                pass
+        syncer._call(lambda c: c.delete_workout(rec["workout_id"]))
+    await anyio.to_thread.run_sync(go)
+    store.set_meta("created_workouts", json.dumps([r for r in created if r is not rec and r != rec]))
+    return {"removed": rec}
 
 
 @mcp.tool()

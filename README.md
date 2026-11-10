@@ -19,6 +19,10 @@ Ask things like *"How recovered am I today?"*, *"Was yesterday's run too hard gi
 | `get_planned_workout` | Step-by-step structure of a planned session (targets, repeats) |
 | `get_training_plan` | Active training plan(s) and progress |
 | `get_races` | Upcoming races, focus race, race-time predictions |
+| `schedule_strength_workout` | Build a structured strength workout (sets/reps/kg/rest/supersets) and put it on the Garmin calendar → syncs to the watch |
+| `list_hevy` / `schedule_hevy_workout` | Send a Hevy routine (or past Hevy workout) to the Garmin calendar |
+| `find_garmin_exercises` / `save_exercise_mapping` | Search Garmin's 1,500+ exercises; remember custom name matches |
+| `remove_created_workout` | Undo a workout this connector created (never touches Runna/Garmin Coach workouts) |
 | `get_raw_garmin_data` | Raw Garmin JSON for anything not in the summaries |
 
 - **History:** backfills **2 years** on first start (takes a few hours in the background; recent data is available within minutes). Resumes where it left off after restarts.
@@ -74,6 +78,12 @@ claude.ai → **Settings → Connectors → Add custom connector**
 
 It then shows up in the browser and the mobile app. Tip: create a Claude Project
 ("Training coach") with instructions like *"Always check my Garmin data before answering."*
+
+## Hevy (optional, needs Hevy Pro)
+Get an API key in Hevy → Settings → Developer, then on the server:
+```bash
+bash ~/garmin-claude/deploy/set-hevy-key.sh
+```
 
 ## Updating the server
 ```bash
