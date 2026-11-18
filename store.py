@@ -132,6 +132,18 @@ class Store:
     def count_missing_details(self) -> int:
         return self._query("SELECT COUNT(*) c FROM activities WHERE details IS NULL")[0]["c"]
 
+    def activity_ids_between(self, start: str, end: str) -> set[int]:
+        """IDs of stored activities whose local start date is in [start, end] (YYYY-MM-DD)."""
+        rows = self._query(
+            "SELECT id FROM activities WHERE substr(start_local, 1, 10) BETWEEN ? AND ?",
+            (start, end),
+        )
+        return {r["id"] for r in rows}
+
+    def delete_activities(self, ids: set[int]) -> None:
+        for act_id in ids:
+            self._exec("DELETE FROM activities WHERE id=?", (act_id,))
+
     def recent_activities(self, limit: int, type_filter: str | None = None,
                           since: str | None = None) -> list[dict]:
         sql = "SELECT summary FROM activities WHERE 1=1"

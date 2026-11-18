@@ -409,12 +409,24 @@ class GarminSyncer:
         return summary
 
     def sync_activities(self, since: date) -> int:
-        acts = self._call(lambda c: c.get_activities_by_date(since.isoformat(), self.today().isoformat())) or []
+        start, end = since.isoformat(), self.today().isoformat()
+        acts = self._call(lambda c: c.get_activities_by_date(start, end)) or []
+        live: set[int] = set()
         for a in acts:
             s = extract_activity(a)
             if s.get("id") is None:
                 continue
+            live.add(int(s["id"]))
             self.store.put_activity(s["id"], s.get("start_local", ""), s.get("type", ""), s, a)
+        # Activities deleted in Garmin Connect (e.g. a watch copy removed by a
+        # "replace" sync) vanish from the listing: drop them here too. Skipped
+        # when Garmin returns nothing at all, which is more likely a hiccup than
+        # every activity in the window having been deleted.
+        if live:
+            gone = self.store.activity_ids_between(start, end) - live
+            if gone:
+                log.info("Removing %d activities deleted in Garmin: %s", len(gone), sorted(gone))
+                self.store.delete_activities(gone)
         return len(acts)
 
     # -- workouts --------------------------------------------------------
