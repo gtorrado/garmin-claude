@@ -91,6 +91,22 @@ bash ~/garmin-claude/deploy/update.sh
 ```
 The first run walks you through adding a read-only GitHub deploy key.
 
+## Storing the history in Postgres (Neon)
+By default the history lives in a SQLite file in `/data`. Set `DATABASE_URL` to keep it in
+Postgres instead (for example Neon), so other apps can read the same data. Tables go in their
+own schema, `garmin` (change with `DB_SCHEMA`).
+
+To move an existing server over without re-downloading 2 years of history:
+```bash
+cd ~/garmin-claude && git pull && cd deploy
+echo 'DATABASE_URL=postgresql://…'  >> .env        # your Neon connection string
+sudo docker compose stop garmin
+sudo docker compose build garmin
+sudo docker compose run --rm garmin python migrate_to_postgres.py   # copies and prints counts
+sudo docker compose up -d
+```
+The SQLite file stays in `deploy/data` untouched, so removing `DATABASE_URL` switches back.
+
 ## Optional settings
 | Variable | Default | |
 |---|---|---|
@@ -98,6 +114,8 @@ The first run walks you through adding a read-only GitHub deploy key.
 | `BACKFILL_DAYS` | `730` | History pulled on first start |
 | `WORKOUT_POLL_MIN` | `10` | How often to check for a new workout |
 | `GARMIN_CALL_DELAY` | `0.4` | Pause between Garmin requests |
+| `DATABASE_URL` | (unset) | Postgres instead of SQLite, see above |
+| `DB_SCHEMA` | `garmin` | Postgres schema for the tables |
 
 ## Security notes
 - The connector URL contains your secret — treat it like a password. Anyone with it can read your data.
