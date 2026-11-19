@@ -26,7 +26,7 @@ import json
 import calendar_tools as cal
 import strength_tools as st
 from garmin_sync import GarminSyncer, trim
-from store import Store
+from store import open_store
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"),
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -39,7 +39,7 @@ SYNC_INTERVAL_MIN = int(os.getenv("SYNC_INTERVAL_MIN", "60"))
 BACKFILL_DAYS = int(os.getenv("BACKFILL_DAYS", "730"))
 POLL_MIN = int(os.getenv("WORKOUT_POLL_MIN", "10"))
 
-store = Store(DATA_DIR / "garmin.db")
+store = open_store(DATA_DIR)
 syncer = GarminSyncer(store, DATA_DIR, TZ)
 
 mcp = MCPServer(
